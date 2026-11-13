@@ -9,6 +9,8 @@
 """
 from __future__ import annotations
 
+from datetime import timedelta
+
 from sqlalchemy import func, select
 
 from src.config.database import session_scope
@@ -19,7 +21,7 @@ from src.models.mine_run import MineRun
 from src.models.pattern import Pattern
 from src.models.recommendation import Recommendation
 from src.models.user import User
-from src.services import mining_service
+from src.services import mining_service, sequence_service, version_service
 
 from scripts.demo_config import DEMO_PASSWORD, DEMO_USERS, ORG, SEED_AUDIT, SEED_RUN
 from scripts.demo_data import MODULE_OF, dataset
@@ -91,19 +93,43 @@ def ensure_sample_counts(db) -> None:
     db.flush()
 
 
+def backfill_event_times(db) -> None:
+    """历史会话补 event_times：以会话 started_at 为基准按分钟递增，迟到事件才能按时间并入。"""
+    from src.utils.timeutil import iso_utc
+
+    for row in db.scalars(select(EventSeq)).all():
+        if row.event_times:
+            continue
+        base = row.started_at
+        row.event_times = [iso_utc(base + timedelta(minutes=index)) for index, _ in enumerate(row.events or [])]
+    db.flush()
+
+
+def backfill_recommendation_suffix(db, run: MineRun) -> None:
+    """历史推荐补 suffix（新挖掘已写入），保证复核继承能按 (用户,后缀,下一步) 匹配。"""
+    suffixes = sequence_service.latest_suffixes(db)
+    for rec in db.scalars(select(Recommendation).where(Recommendation.run_id == run.id)).all():
+        if not rec.suffix:
+            rec.suffix = list(suffixes.get(rec.user_id, []))
+    db.flush()
+
+
 def ensure_mining(db) -> MineRun:
     run = db.scalar(select(MineRun).where(MineRun.seed_key == SEED_RUN["seed_key"]))
-    if run is not None:
-        return run
-    return mining_service.create_and_execute(
-        db,
-        min_support_pct=SEED_RUN["min_support_pct"],
-        max_len=SEED_RUN["max_len"],
-        top_k=SEED_RUN["top_k"],
-        trigger=SEED_RUN["trigger"],
-        operator_email=SEED_RUN["operator"],
-        seed_key=SEED_RUN["seed_key"],
-    )
+    if run is None:
+        run = mining_service.create_and_execute(
+            db,
+            min_support_pct=SEED_RUN["min_support_pct"],
+            max_len=SEED_RUN["max_len"],
+            top_k=SEED_RUN["top_k"],
+            trigger=SEED_RUN["trigger"],
+            operator_email=SEED_RUN["operator"],
+            seed_key=SEED_RUN["seed_key"],
+        )
+    # 初始化运行作为首个正式版；已切换过则不重复 promote
+    if run.stage == "done" and not run.is_active and version_service.active_run(db) is None:
+        version_service.promote(db, run)
+    return run
 
 
 def ensure_audit(db) -> None:
@@ -131,7 +157,9 @@ def seed_all() -> dict:
         events = ensure_events(db, data["events"])
         sequences = ensure_sequences(db, data["sessions"])
         ensure_sample_counts(db)
+        backfill_event_times(db)
         run = ensure_mining(db)
+        backfill_recommendation_suffix(db, run)
         ensure_audit(db)
         db.flush()
         patterns = db.scalar(select(func.count()).select_from(Pattern).where(Pattern.run_id == run.id)) or 0

@@ -11,9 +11,11 @@ from src.config.settings import settings
 from src.constants.enums import MODULE_LABELS, MODULE_ORDER, REVIEW_STATUS_LABELS, MINE_STATUS_LABELS
 from src.models.event_def import EventDef
 from src.models.event_seq import EventSeq
+from src.models.ingest_cursor import IngestCursor
 from src.models.mine_run import MineRun
 from src.models.pattern import Pattern
 from src.models.recommendation import Recommendation
+from src.services import version_service
 from src.utils.timeutil import iso_utc, local_now, utcnow
 
 MODULE_TONE = {
@@ -91,15 +93,73 @@ def waterfall(db: Session, buckets: int = 12) -> list[dict]:
     return rows
 
 
+def _run_brief(run: MineRun | None) -> dict | None:
+    if run is None:
+        return None
+    return {
+        "id": run.id,
+        "run_no": run.run_no,
+        "status": run.status,
+        "status_label": MINE_STATUS_LABELS.get(run.status, run.status),
+        "stage": run.stage,
+        "is_active": run.is_active,
+        "started_at": iso_utc(run.started_at),
+        "pattern_count": run.pattern_count,
+        "rec_count": run.rec_count,
+        "coverage_pct": run.coverage_pct,
+        "covered_users": run.covered_users,
+        "active_users": run.active_users,
+        "carried_recs": run.carried_recs,
+        "reset_recs": run.reset_recs,
+        "watermark_at": iso_utc(run.watermark_at),
+        "ingested_events": run.ingested_events,
+        "min_support_pct": run.min_support_pct,
+        "max_len": run.max_len,
+        "top_support_pct": (run.metrics or {}).get("top_support_pct", 0.0),
+    }
+
+
+def _ingest_watermark(db: Session) -> dict:
+    rows = db.scalars(select(IngestCursor).order_by(IngestCursor.source)).all()
+    watermark_at = max((row.last_event_at for row in rows if row.last_event_at), default=None)
+    return {
+        "watermark_at": iso_utc(watermark_at),
+        "ingested_events": sum(row.ingested_events for row in rows),
+        "duplicate_events": sum(row.duplicate_events for row in rows),
+        "late_events": sum(row.late_events for row in rows),
+        "sources": [
+            {
+                "source": row.source,
+                "last_event_at": iso_utc(row.last_event_at),
+                "ingested_events": row.ingested_events,
+                "duplicate_events": row.duplicate_events,
+                "late_events": row.late_events,
+            }
+            for row in rows
+        ],
+    }
+
+
 def overview(db: Session) -> dict:
     sessions = db.scalar(select(func.count()).select_from(EventSeq)) or 0
     converted = db.scalar(select(func.count()).select_from(EventSeq).where(EventSeq.converted.is_(True))) or 0
     users = db.scalar(select(func.count(func.distinct(EventSeq.user_id)))) or 0
     events_total = db.scalar(select(func.count()).select_from(EventDef)) or 0
-    run = db.scalar(select(MineRun).order_by(MineRun.id.desc()).limit(1))
-    latest_patterns = db.scalar(select(func.count()).select_from(Pattern).where(Pattern.run_id == run.id)) if run else 0
+    active = version_service.active_run(db)
+    # 候选版：最新一个未切换（非 active）且未失败归档的运行
+    candidate = db.scalar(
+        select(MineRun).where(MineRun.is_active.is_(False)).order_by(MineRun.id.desc()).limit(1)
+    )
+    run = active or candidate
+    latest_patterns = (
+        db.scalar(select(func.count()).select_from(Pattern).where(Pattern.run_id == run.id)) if run else 0
+    )
     pending = (
-        db.scalar(select(func.count()).select_from(Recommendation).where(Recommendation.run_id == run.id, Recommendation.status == "pending"))
+        db.scalar(
+            select(func.count())
+            .select_from(Recommendation)
+            .where(Recommendation.run_id == run.id, Recommendation.status == "pending")
+        )
         if run
         else 0
     )
@@ -115,6 +175,9 @@ def overview(db: Session) -> dict:
         if run
         else []
     )
+    switch_diff = None
+    if candidate is not None and candidate.stage == "done":
+        switch_diff = version_service.run_diff(db, active.id if active else None, candidate.id)
     return {
         "sequences_total": sessions,
         "converted_total": converted,
@@ -125,23 +188,11 @@ def overview(db: Session) -> dict:
         "patterns_total": latest_patterns or 0,
         "pending_total": pending or 0,
         "worker_alive": worker_alive(),
-        "latest_run": {
-            "id": run.id,
-            "run_no": run.run_no,
-            "status": run.status,
-            "status_label": MINE_STATUS_LABELS.get(run.status, run.status),
-            "started_at": iso_utc(run.started_at),
-            "pattern_count": run.pattern_count,
-            "rec_count": run.rec_count,
-            "coverage_pct": run.coverage_pct,
-            "covered_users": run.covered_users,
-            "active_users": run.active_users,
-            "min_support_pct": run.min_support_pct,
-            "max_len": run.max_len,
-            "top_support_pct": (run.metrics or {}).get("top_support_pct", 0.0),
-        }
-        if run
-        else None,
+        "active_run": _run_brief(active),
+        "candidate_run": _run_brief(candidate),
+        "latest_run": _run_brief(run),
+        "watermark": _ingest_watermark(db),
+        "switch_diff": switch_diff,
         "review": [
             {"key": key, "label": REVIEW_STATUS_LABELS.get(key, key), "count": count}
             for key, count in sorted(status_rows, key=lambda item: item[0])

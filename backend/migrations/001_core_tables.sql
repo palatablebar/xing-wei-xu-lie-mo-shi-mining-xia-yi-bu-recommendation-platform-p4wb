@@ -25,12 +25,13 @@ CREATE TABLE event_defs (
     updated_at      DATETIME     NOT NULL
 );
 
--- 600 条会话：events 为事件码有序数组（JSON）
+-- 600 条会话：events 为事件码有序数组（JSON），event_times 为对齐的事件发生时间
 CREATE TABLE event_seqs (
     id              INT AUTO_INCREMENT PRIMARY KEY,
     session_id      VARCHAR(40)  NOT NULL UNIQUE,
     user_id         VARCHAR(24)  NOT NULL,
     events          JSON,
+    event_times     JSON,
     event_count     INT          NOT NULL DEFAULT 0,
     modules_path    VARCHAR(160),
     started_at      DATETIME     NOT NULL,
@@ -38,6 +39,42 @@ CREATE TABLE event_seqs (
     created_at      DATETIME     NOT NULL,
     INDEX ix_event_seqs_user (user_id),
     INDEX ix_event_seqs_started (started_at)
+);
+
+-- 采集水位：每路采集源已确认并入到哪一条事件（幂等重放 + 迟到并入）
+CREATE TABLE ingest_cursors (
+    id               INT AUTO_INCREMENT PRIMARY KEY,
+    source           VARCHAR(64)  NOT NULL UNIQUE,
+    last_event_id    VARCHAR(120),
+    last_event_at    DATETIME,
+    ingested_events  INT          NOT NULL DEFAULT 0,
+    duplicate_events INT          NOT NULL DEFAULT 0,
+    late_events      INT          NOT NULL DEFAULT 0,
+    updated_at       DATETIME     NOT NULL,
+    created_at       DATETIME     NOT NULL,
+    INDEX ix_ingest_cursors_event_at (last_event_at)
+);
+
+-- 已并入事件台账：event_id 主键即幂等屏障，同批重跑/重复投递不新增
+CREATE TABLE ingested_events (
+    event_id     VARCHAR(120) PRIMARY KEY,
+    source       VARCHAR(64)  NOT NULL,
+    session_id   VARCHAR(40)  NOT NULL,
+    event_code   VARCHAR(40)  NOT NULL,
+    event_at     DATETIME,
+    created_at   DATETIME     NOT NULL,
+    INDEX ix_ingested_events_source (source),
+    INDEX ix_ingested_events_session (session_id),
+    INDEX ix_ingested_events_event_at (event_at)
+);
+
+-- 应用级 key/value 状态：当前正式版挖掘运行指针
+CREATE TABLE app_state (
+    id           INT AUTO_INCREMENT PRIMARY KEY,
+    state_key    VARCHAR(64)  NOT NULL UNIQUE,
+    state_value  VARCHAR(120),
+    updated_at   DATETIME     NOT NULL,
+    created_at   DATETIME     NOT NULL
 );
 
 -- 一次 PrefixSpan 挖掘
@@ -49,6 +86,13 @@ CREATE TABLE mine_runs (
     top_k           INT          NOT NULL DEFAULT 50,
     trigger         VARCHAR(20)  NOT NULL,
     status          VARCHAR(20)  NOT NULL,
+    is_active       TINYINT(1)   NOT NULL DEFAULT 0,
+    stage           VARCHAR(16)  NOT NULL DEFAULT 'queued',
+    watermark_at    DATETIME,
+    ingested_events INT          NOT NULL DEFAULT 0,
+    carried_recs    INT          NOT NULL DEFAULT 0,
+    reset_recs      INT          NOT NULL DEFAULT 0,
+    promoted_at     DATETIME,
     operator_email  VARCHAR(160) NOT NULL,
     sequence_count  INT          NOT NULL DEFAULT 0,
     pattern_count   INT          NOT NULL DEFAULT 0,
@@ -60,7 +104,10 @@ CREATE TABLE mine_runs (
     log_text        TEXT,
     seed_key        VARCHAR(120) UNIQUE,
     started_at      DATETIME     NOT NULL,
-    finished_at     DATETIME
+    finished_at     DATETIME,
+    INDEX ix_mine_runs_active (is_active),
+    INDEX ix_mine_runs_stage (stage),
+    INDEX ix_mine_runs_watermark (watermark_at)
 );
 
 -- 频繁序列模式（支持度 / 置信度 / 提升度由后端算出）
@@ -94,10 +141,12 @@ CREATE TABLE recommendations (
     score           DOUBLE       NOT NULL DEFAULT 0,
     priority        VARCHAR(12)  NOT NULL DEFAULT 'medium',
     status          VARCHAR(16)  NOT NULL DEFAULT 'pending',
+    carry_state     VARCHAR(12)  NOT NULL DEFAULT 'new',
     reviewer        VARCHAR(160),
     review_note     VARCHAR(1000),
     created_at      DATETIME     NOT NULL,
     updated_at      DATETIME     NOT NULL,
+    INDEX ix_rec_carry (carry_state),
     CONSTRAINT uq_rec_run_user_pattern_next UNIQUE (run_id, user_id, pattern_id, next_event),
     CONSTRAINT fk_rec_run FOREIGN KEY (run_id) REFERENCES mine_runs(id) ON DELETE CASCADE,
     CONSTRAINT fk_rec_pattern FOREIGN KEY (pattern_id) REFERENCES patterns(id) ON DELETE CASCADE

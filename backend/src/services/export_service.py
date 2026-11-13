@@ -9,6 +9,7 @@ from src.models.event_def import EventDef
 from src.models.mine_run import MineRun
 from src.models.pattern import Pattern
 from src.models.recommendation import Recommendation
+from src.services import version_service
 from src.utils.csv_export import to_csv
 
 
@@ -17,6 +18,9 @@ def _labels(db: Session) -> dict[str, str]:
 
 
 def recommendations_csv(db: Session, run_id: int | None = None) -> bytes:
+    if run_id is None:
+        active = version_service.active_run(db)
+        run_id = active.id if active else None
     stmt = select(Recommendation)
     if run_id:
         stmt = stmt.where(Recommendation.run_id == run_id)
@@ -59,6 +63,9 @@ def recommendations_csv(db: Session, run_id: int | None = None) -> bytes:
 
 
 def patterns_csv(db: Session, run_id: int | None = None) -> bytes:
+    if run_id is None:
+        active = version_service.active_run(db)
+        run_id = active.id if active else None
     stmt = select(Pattern)
     if run_id:
         stmt = stmt.where(Pattern.run_id == run_id)

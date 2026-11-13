@@ -26,21 +26,41 @@ export const sequencesPage = {
   async render(view, ctx) {
     let data;
     let stats;
+    let watermark;
     try {
-      [data, stats] = await Promise.all([
+      [data, stats, watermark] = await Promise.all([
         api.get('/api/sequences', { q: state.q, converted: state.converted, min_len: state.minLen, limit: 60 }),
         api.get('/api/sequences/stats'),
+        api.get('/api/sequences/watermark'),
       ]);
     } catch (err) {
       view.innerHTML = errorBox(errorMessage(err));
       view.querySelector('#retry-btn')?.addEventListener('click', () => sequencesPage.render(view, ctx));
       return;
     }
+    const wmItems = watermark.items || [];
     view.innerHTML = `
+      <section class="panel">
+        <div class="panel-head"><h2>采集水位</h2><span class="meta">幂等并入 · 迟到按时间归位</span></div>
+        <div class="panel-body">
+          ${wmItems.length
+            ? table({
+                rows: wmItems,
+                columns: [
+                  { key: 'source', label: '采集源', className: 'mono' },
+                  { key: 'last_event_at', label: '时间水位', render: (row) => fmtTime(row.last_event_at) },
+                  { key: 'ingested_events', label: '已并入', className: 'num' },
+                  { key: 'duplicate_events', label: '重复拦截', className: 'num' },
+                  { key: 'late_events', label: '迟到并入', className: 'num' },
+                ],
+              })
+            : '<div class="legend"><span>暂无采集源（演示数据由 seed 初始化）。</span></div>'}
+        </div>
+      </section>
       <section class="panel">
         <div class="panel-head">
           <h2>序列浏览</h2>
-          <span class="meta">${data.total} 条会话 · 均值 ${esc(stats.avg_events)} 事件 · 转化 ${esc(stats.converted_total)} 条（${esc(stats.conversion_pct)}%）</span>
+          <span class="meta">${data.total} 条会话 · 均值 ${esc(stats.avg_events)} 事件 · 转化 ${esc(stats.conversion_total)} 条（${esc(stats.conversion_pct)}%）</span>
         </div>
         <div class="panel-body">
           <div class="filter-bar" id="sequence-filters">

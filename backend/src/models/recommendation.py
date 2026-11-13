@@ -28,6 +28,8 @@ class Recommendation(Base):
     score: Mapped[float] = mapped_column(Float, default=0.0)
     priority: Mapped[str] = mapped_column(String(12), default="medium", index=True)
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    # 复核继承：same=沿用正式版结论（同用户+后缀+下一步未变）；changed=口径变化回待复核；new=本批新增
+    carry_state: Mapped[str] = mapped_column(String(12), default="new", index=True)
     reviewer: Mapped[str | None] = mapped_column(String(160), nullable=True)
     review_note: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)

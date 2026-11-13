@@ -28,10 +28,17 @@ def heartbeat() -> str:
 
 @celery_app.task(name=TASK_DAILY)
 def daily_remine() -> dict:
-    """每天用最新会话重跑一次挖掘，产出新的模式库与推荐名单。"""
-    from src.config.database import session_scope
-    from src.services import audit_service, mining_service
+    """每天用最新会话做一次可恢复重挖：候选版分阶段跑完，不自动切换正式版。
 
+    同批重跑（当天再次触发）命中同一 seed_key：未完成则从断点续跑，
+    已完成则原样返回，不新增运行、不重复落库。切换由人工在推荐台/挖掘页确认。
+    """
+    from src.config.database import session_scope
+    from src.services import audit_service, mining_service, version_service
+    from src.utils.timeutil import local_now
+
+    operator = "scheduler@" + settings.app_name + ".io"
+    batch_key = f"daily-{local_now():%Y%m%d}"
     with session_scope() as db:
         run = mining_service.create_and_execute(
             db,
@@ -39,17 +46,33 @@ def daily_remine() -> dict:
             max_len=5,
             top_k=50,
             trigger="schedule",
-            operator_email="scheduler@" + settings.app_name + ".io",
+            operator_email=operator,
+            seed_key=batch_key,
         )
+        active = version_service.active_run(db)
         audit_service.record(
             db,
-            actor_email="scheduler@" + settings.app_name + ".io",
+            actor_email=operator,
             actor_role="admin",
             action="mining.create",
             entity="mine_run",
             entity_id=run.id,
-            detail={"trigger": "schedule", "run_no": run.run_no, "patterns": run.pattern_count},
+            detail={
+                "trigger": "schedule",
+                "batch": batch_key,
+                "run_no": run.run_no,
+                "stage": run.stage,
+                "status": run.status,
+                "patterns": run.pattern_count,
+                "active_run_no": active.run_no if active else None,
+            },
             layer="worker",
         )
-    logger.info("daily remine finished: %s patterns", run.pattern_count)
-    return {"run_no": run.run_no, "patterns": run.pattern_count, "recommendations": run.rec_count}
+    logger.info("daily remine batch=%s stage=%s patterns=%s", batch_key, run.stage, run.pattern_count)
+    return {
+        "batch": batch_key,
+        "run_no": run.run_no,
+        "stage": run.stage,
+        "patterns": run.pattern_count,
+        "recommendations": run.rec_count,
+    }

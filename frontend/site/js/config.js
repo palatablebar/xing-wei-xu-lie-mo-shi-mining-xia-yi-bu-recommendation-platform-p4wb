@@ -60,6 +60,24 @@ export const ENUMS = {
     partial: '部分成功',
     failed: '失败',
   },
+  runStage: {
+    queued: '排队',
+    patterns: '模式挖掘',
+    recommend: '推荐生成',
+    coverage: '覆盖率统计',
+    done: '待切换',
+    failed: '失败',
+  },
+  edition: {
+    candidate: '候选版',
+    active: '正式版',
+    archived: '历史版',
+  },
+  carryState: {
+    new: '新增',
+    same: '沿用原结论',
+    changed: '口径变化·待复核',
+  },
   trigger: {
     manual: '手动',
     schedule: '定时',

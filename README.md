@@ -12,7 +12,7 @@
 | --- | --- | --- |
 | `frontend` | Nginx 静态站，原生 HTML/CSS/JS（ES Modules，无框架无构建） | `FRONTEND_PORT=18209` |
 | `backend` | FastAPI + SQLAlchemy 2.0，全部计算/校验/持久化在后端 | `BACKEND_PORT=19209` |
-| `worker` | Celery worker + beat：心跳与每日增量重挖 | 内网 |
+| `worker` | Celery worker + beat：心跳与每日可恢复重挖（候选版，不自动切换） | 内网 |
 | `db` | MySQL 8.0（utf8mb4） | `DB_PORT=17709` |
 | `redis` | 限流计数 + worker 心跳 | 内网 |
 
@@ -35,15 +35,18 @@ docker compose exec -T backend python -m pytest tests -q
 事件码重复 409。视图层再加一层按钮收敛，`site/js/config.js` 的 `PERMISSIONS` 与后端
 `src/constants/roles.py` 一一对应。
 
-## 3. 领域实体（5 张表）
+## 3. 领域实体（8 张表）
 
 | 实体 | 表 | 关键字段 |
 | --- | --- | --- |
 | `EventDef` 事件口径 | `event_defs` | `code`、`module`、`label`、`is_key`、`weight`、`sample_count` |
-| `EventSeq` 会话序列 | `event_seqs` | `session_id`、`user_id`、`events`(JSON)、`event_count`、`started_at`、`converted` |
-| `MineRun` 挖掘运行 | `mine_runs` | `run_no`、`min_support_pct`、`max_len`、`top_k`、`status`、`metrics`、`coverage_pct` |
+| `EventSeq` 会话序列 | `event_seqs` | `session_id`、`user_id`、`events`(JSON)、`event_times`(JSON,对齐事件时间)、`event_count`、`started_at`、`converted` |
+| `IngestCursor` 采集水位 | `ingest_cursors` | `source`、`last_event_id`、`last_event_at`、`ingested_events`、`duplicate_events`、`late_events` |
+| `IngestedEvent` 已并入事件台账 | `ingested_events` | `event_id`(主键,幂等屏障)、`source`、`session_id`、`event_code`、`event_at` |
+| `AppState` 应用状态 | `app_state` | `state_key`、`state_value`（正式版运行指针 `active_mine_run_id`） |
+| `MineRun` 挖掘运行 | `mine_runs` | `run_no`、`status`、`stage`、`is_active`、`watermark_at`、`ingested_events`、`carried_recs`、`reset_recs`、`promoted_at`、`metrics`、`coverage_pct` |
 | `Pattern` 频繁序列 | `patterns` | `items`(JSON)、`length`、`support_count`、`support_pct`、`confidence`、`lift`、`rank` |
-| `Recommendation` 下一步推荐 | `recommendations` | `user_id`、`suffix`(JSON)、`next_event`、`confidence`、`lift`、`score`、`priority`、`status` |
+| `Recommendation` 下一步推荐 | `recommendations` | `user_id`、`suffix`(JSON)、`next_event`、`confidence`、`lift`、`score`、`priority`、`status`、`carry_state` |
 
 每个实体贯穿「表 → model → schema → service → controller → route → 前端 api → 页面」，
 DDL 参考见 `backend/migrations/001_core_tables.sql`。
@@ -71,6 +74,21 @@ DDL 参考见 `backend/migrations/001_core_tables.sql`。
 
 > 结果全部落库（`patterns` / `recommendations`），前端只做展示与筛选，不参与任何计算。
 
+### 4.3 可恢复重挖、版本切换与复核继承
+
+采集侧重发迟到事件、同批事件重复到达，旧的「每日全量覆盖」会让复核意见和名单混杂。新口径：
+
+- **幂等采集**（`services/ingest_service.py`）：`ingested_events.event_id` 是唯一台账，同批重跑/重复投递直接拦截不新增；
+  迟到事件按 `occurred_at` 并入原会话（不新建会话），按时间重排并合并相邻重复，`ingest_cursors` 记录每路水位（时间水位 + 并入/重复/迟到计数）。
+- **分阶段可恢复重挖**（`services/mining_service.py`）：每次重挖产出候选运行（`is_active=false`），四阶段
+  `queued → patterns → recommend → coverage → done`，每阶段独立事务提交。中断/失败停在断点（`metrics.last_good_stage`），
+  同 `seed_key` 重跑或调 `/resume` 从断点续跑，不新建运行、不重复落库。
+- **一次性切换**（`services/version_service.py`）：模式、推荐、覆盖率全部 `done` 后才允许 `promote`；
+  切换只改 `app_state` 指针与 `mine_runs.is_active`，各版本数据按 `run_id` 隔离。失败不触碰正式版，可 `rollback` 到任一历史版。
+- **复核意见继承**：候选推荐按 `(user_id, suffix, next_event)` 与正式版比对——三者一致且正式版已复核则沿用结论
+  （`carry_state=same`，保留状态/复核人/备注）；口径变化回待复核（`changed`）；全新推荐为 `new`。正式版复核意见永不覆盖、不丢失。
+- 推荐/模式/导出在不指定 `run_id` 时默认读**正式版**，候选版未切换不会混入名单。
+
 ## 5. API
 
 | 方法 | 路径 | 说明 | 权限 |
@@ -80,9 +98,13 @@ DDL 参考见 `backend/migrations/001_core_tables.sql`。
 | GET | `/api/overview` | 会话数/覆盖率/模式数/信号瀑布 | 三角色 |
 | GET/POST/PATCH | `/api/events`、`/api/events/{id}` | 事件字典 | 读三角色，写仅 admin |
 | GET | `/api/sequences`、`/api/sequences/{id}`、`/api/sequences/stats` | 会话序列浏览 | 三角色（viewer 脱敏） |
-| GET/POST | `/api/mine-runs`、`/api/mine-runs/{id}` | 挖掘运行 | 读三角色，发起 admin+analyst |
-| GET | `/api/patterns`、`/api/patterns/distribution` | 模式库 | 三角色 |
-| GET | `/api/recommendations`、`/api/recommendations/{id}` | 推荐名单 | 三角色（viewer 脱敏） |
+| GET | `/api/sequences/watermark` | 采集水位（时间水位/并入/重复/迟到） | 三角色 |
+| POST | `/api/sequences/ingest` | 事件幂等并入（迟到按时间归位） | admin+analyst（viewer 403） |
+| GET/POST | `/api/mine-runs`、`/api/mine-runs/{id}` | 挖掘运行（POST 产出候选版） | 读三角色，发起 admin+analyst |
+| GET | `/api/mine-runs/active`、`/api/mine-runs/{id}/diff` | 正式版指针 / 切换前后差异 | 三角色 |
+| POST | `/api/mine-runs/{id}/resume`、`/promote`、`/rollback` | 断点续跑 / 切换正式版 / 回滚历史版 | admin+analyst（viewer 403） |
+| GET | `/api/patterns`、`/api/patterns/distribution` | 模式库（默认正式版） | 三角色 |
+| GET | `/api/recommendations`、`/api/recommendations/{id}` | 推荐名单（默认正式版，viewer 脱敏） | 三角色 |
 | PATCH | `/api/recommendations/{id}/review` | 复核采纳/驳回 | admin+analyst（viewer 403） |
 | GET | `/api/exports/recommendations.csv`、`patterns.csv`、`mine-runs.csv` | CSV 导出 | admin+analyst（viewer 403） |
 | GET | `/api/audit` | 审计日志 | 仅 admin |
@@ -91,11 +113,11 @@ DDL 参考见 `backend/migrations/001_core_tables.sql`。
 ## 6. 页面（原生 ES Modules）
 
 1. `#/login` 登录（信号 scope + 操作员终端版式）
-2. `#/overview` 总览：四条仪器读数 + **信号瀑布**（12 个时间桶 × 6 模块堆叠）+ 模块事件量 + 模式支持度阶梯
+2. `#/overview` 总览：仪器读数 + **本批采集水位** + 信号瀑布 + 模块事件量 + 正式版/候选版 + 切换前后差异
 3. `#/events` 事件字典（列表 + 抽屉详情 + admin 改口径/登记）
-4. `#/sequences` 序列浏览（筛选 + 事件轨道 chip + 抽屉全文）
-5. `#/mining` 模式挖掘（运行列表 + 发起挖掘 + 参数口径 + 模式库阶梯/表格 + 导出）
-6. `#/recommendations` 推荐名单（筛选 + 抽屉复核 + 导出 CSV）
+4. `#/sequences` 序列浏览（采集水位 + 筛选 + 事件轨道 chip + 抽屉全文）
+5. `#/mining` 模式挖掘（候选/正式/历史运行 + 发起重挖 + 断点续跑 + 切换/回滚 + 差异确认 + 模式库 + 导出）
+6. `#/recommendations` 推荐名单（默认正式版 + 复核继承标记 + 筛选 + 抽屉复核 + 导出 CSV）
 7. `#/audit` 审计日志（仅 admin 可见可访问）
 
 共用组件：`site/js/ui.js` 的 `table` / `drawer` / `field` / `readouts` / `waterfall` / `track` / `ladder` / `badge`。
@@ -106,6 +128,9 @@ DDL 参考见 `backend/migrations/001_core_tables.sql`。
 | --- | --- | --- |
 | 6 个模块 `account/integration/board/report/alert/billing` | `backend/src/constants/enums.py::Module`、`MODULE_LABELS` | `site/js/config.js::ENUMS.module` |
 | 挖掘状态 `queued/running/success/partial/failed` | `enums.py::MineStatus`、`MINE_STATUS_LABELS` | `ENUMS.mineStatus`、`config.js::statusTone` |
+| 运行阶段 `queued/patterns/recommend/coverage/done/failed` | `enums.py::RunStage`、`RUN_STAGE_LABELS` | `ENUMS.runStage` |
+| 版本 `candidate/active/archived` | `enums.py::RunEdition`、`RUN_EDITION_LABELS` | `ENUMS.edition` |
+| 复核继承 `new/same/changed` | `enums.py::CarryState`、`CARRY_STATE_LABELS` | `ENUMS.carryState` |
 | 触发方式 `manual/schedule/seed` | `enums.py::TriggerKind`、`TRIGGER_LABELS` | `ENUMS.trigger` |
 | 复核状态 `pending/confirmed/dismissed` | `enums.py::ReviewStatus`、`REVIEW_STATUS_LABELS` | `ENUMS.reviewStatus`、`reviewTone` |
 | 优先级 `high/medium/low` | `enums.py::RecPriority`、`REC_PRIORITY_LABELS` | `ENUMS.priority`、`badgeTone` |
@@ -117,7 +142,8 @@ DDL 参考见 `backend/migrations/001_core_tables.sql`。
 **12 个事件、600 条会话（均值约 8 事件）、90 条转化会话、1 次初始化挖掘**。
 `backend/scripts/seed_demo.py` 按自然键 upsert：`users.email`、`event_defs.code`、`event_seqs.session_id`、
 `mine_runs.seed_key`、`patterns(run_id, seq_key)`、`recommendations(run_id, user_id, pattern_id, next_event)`、
-`audit_logs.seed_key`；重复执行不新增记录、不覆盖人工复核过的推荐状态。
+`audit_logs.seed_key`；重复执行不新增记录、不覆盖人工复核过的推荐状态。seed 还会回填历史会话的 `event_times`
+与历史推荐的 `suffix`，并把首次初始化挖掘 `promote` 为第一个正式版（已存在正式版则不重复切换）。
 
 结束时打印一行（两次执行逐字一致）：
 
@@ -137,7 +163,10 @@ BASE_URL=http://localhost:18209 node ../test-artifacts/gb-610/tests/screenshots.
 
 - `backend/tests/test_prefixspan.py`：频次门槛、边界（等于最小计数入选 / 少一条落选）、长度上限、top_k 截断、置信度与提升度算术、单事件不计、空输入、确定性；
 - `backend/tests/test_recommender.py`：后缀匹配、不推荐刚做过的动作、无匹配返回空、按分数排序、同模块 ≤2、每用户 ≤6、覆盖率、优先级分档；
-- `backend/tests/test_security.py`：密码哈希、JWT 往返、非法 token。
+- `backend/tests/test_security.py`：密码哈希、JWT 往返、非法 token；
+- `backend/tests/test_ingest.py`：迟到事件按时间并入、相邻重复合并、同批重放 event_id 去重、批内重复只计一次、水位计数；
+- `backend/tests/test_mining_version.py`：分阶段到 done、promote/rollback、复核 same/changed/new 继承、失败断点续跑不重复落库、同批重跑不新建运行；
+- `backend/tests/smoke_e2e.py` / `smoke_http.py`：SQLite 全链路与 TestClient HTTP 冒烟（采集→重挖→差异→切换→回滚→总览→审计→403）。
 - 真机结果（含 seed 两次原文、pytest、smoke、403、关键数值、截图清单）记录在
   `batch-20261113/test-artifacts/gb-610/TESTING.md`。
 
@@ -159,4 +188,6 @@ BASE_URL=http://localhost:18209 node ../test-artifacts/gb-610/tests/screenshots.
 
 - 合成埋点数据（无真实客户埋点），会话时长与转化规则是演示口径；
 - 模式库按支持度倒序截断 top_k（默认 50），更长的稀有路径不会进入推荐候选；
-- 定时重挖用 Celery beat 触发，只跑一次全量，未做增量窗口与断点续算。
+- 重挖仍是对当前全量会话重算 PrefixSpan（数据量在 600 会话量级），增量体现在**采集幂等并入**与**分阶段断点续跑**：
+  失败可从断点恢复、同批重跑不新增不重复，但模式计算本身不做滑动窗口增量；
+- 复核继承以 `(user_id, suffix, next_event)` 完全相等为「沿用」口径，后缀或下一步任一变化即回待复核。

@@ -17,6 +17,8 @@ class EventSeq(Base):
     session_id: Mapped[str] = mapped_column(String(40), unique=True, index=True)
     user_id: Mapped[str] = mapped_column(String(24), index=True)
     events: Mapped[list] = mapped_column(JSON, default=list)
+    # 与 events 对齐的事件发生时间（ISO 字符串）；迟到事件按它并入后重排，历史行可为空
+    event_times: Mapped[list | None] = mapped_column(JSON, nullable=True, default=None)
     event_count: Mapped[int] = mapped_column(Integer, default=0)
     modules_path: Mapped[str | None] = mapped_column(String(160), nullable=True)
     started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)

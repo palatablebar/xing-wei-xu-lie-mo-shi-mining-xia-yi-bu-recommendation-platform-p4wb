@@ -8,6 +8,7 @@ from src.constants.enums import MODULE_LABELS
 from src.models.event_def import EventDef
 from src.models.mine_run import MineRun
 from src.models.pattern import Pattern
+from src.services import version_service
 from src.utils.errors import not_found
 from src.utils.timeutil import iso_utc
 
@@ -53,6 +54,10 @@ def list_patterns(
     limit: int = 50,
     offset: int = 0,
 ) -> dict:
+    # 不指定运行时默认读正式版模式库
+    if run_id is None:
+        active = version_service.active_run(db)
+        run_id = active.id if active else None
     stmt = select(Pattern)
     count_stmt = select(func.count()).select_from(Pattern)
     if run_id:

@@ -4,12 +4,13 @@ from __future__ import annotations
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from src.constants.enums import MODULE_LABELS, REC_PRIORITY_LABELS, REVIEW_STATUS_LABELS
+from src.constants.enums import CARRY_STATE_LABELS, MODULE_LABELS, REC_PRIORITY_LABELS, REVIEW_STATUS_LABELS
 from src.models.event_def import EventDef
 from src.models.mine_run import MineRun
 from src.models.pattern import Pattern
 from src.models.recommendation import Recommendation
 from src.services.sequence_service import mask_user
+from src.services import version_service
 from src.utils.errors import not_found
 from src.utils.timeutil import iso_utc, utcnow
 
@@ -44,6 +45,8 @@ def serialize(rec: Recommendation, labels: dict[str, dict], run_no: str | None =
         "priority_label": REC_PRIORITY_LABELS.get(rec.priority, rec.priority),
         "status": rec.status,
         "status_label": REVIEW_STATUS_LABELS.get(rec.status, rec.status),
+        "carry_state": rec.carry_state,
+        "carry_state_label": CARRY_STATE_LABELS.get(rec.carry_state, rec.carry_state),
         "reviewer": rec.reviewer,
         "review_note": rec.review_note,
         "created_at": iso_utc(rec.created_at),
@@ -63,6 +66,10 @@ def list_recommendations(
     limit: int = 20,
     offset: int = 0,
 ) -> dict:
+    # 不指定运行时默认读正式版，避免候选版未切换就混入名单与复核
+    if run_id is None:
+        active = version_service.active_run(db)
+        run_id = active.id if active else None
     stmt = select(Recommendation)
     count_stmt = select(func.count()).select_from(Recommendation)
     if run_id:
@@ -136,6 +143,9 @@ def review(db: Session, rec: Recommendation, *, status: str, note: str | None, r
 
 
 def priority_counts(db: Session, run_id: int | None = None) -> list[dict]:
+    if run_id is None:
+        active = version_service.active_run(db)
+        run_id = active.id if active else None
     stmt = select(Recommendation.priority, func.count()).group_by(Recommendation.priority)
     if run_id:
         stmt = stmt.where(Recommendation.run_id == run_id)

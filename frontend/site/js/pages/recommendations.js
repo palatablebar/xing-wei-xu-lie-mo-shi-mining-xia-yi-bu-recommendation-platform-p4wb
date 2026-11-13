@@ -20,6 +20,7 @@ function openRecommendation(view, ctx, item) {
       ['分数（置信度×提升度）', `<span class="mono hl">${esc(item.score.toFixed(4))}</span>`],
       ['优先级', `<span class="badge ${badgeTone(item.priority)}">${esc(ENUMS.priority[item.priority] || item.priority)}</span>`],
       ['复核状态', `<span class="badge ${reviewTone(item.status)}">${esc(ENUMS.reviewStatus[item.status] || item.status)}</span>`],
+      ['继承口径', `<span class="badge info">${esc(ENUMS.carryState[item.carry_state] || item.carry_state)}</span>`],
       ['复核人', esc(item.reviewer || '—')],
       ['复核备注', esc(item.review_note || '—')],
       ['生成时间', fmtTime(item.created_at)],
@@ -85,7 +86,7 @@ export const recommendationsPage = {
         <div class="panel-body">
           <div class="filter-bar" id="rec-filters">
             ${field({ label: '搜索', name: 'q', value: state.q, placeholder: '用户 ID / 事件码' })}
-            ${field({ label: '挖掘运行', name: 'run_id', value: state.runId, options: [{ value: '', label: '全部运行' }, ...runs.items.map((run) => ({ value: run.id, label: run.run_no }))] })}
+            ${field({ label: '挖掘运行', name: 'run_id', value: state.runId, options: [{ value: '', label: '正式版（默认）' }, ...runs.items.map((run) => ({ value: run.id, label: `${run.run_no}${run.is_active ? '（正式）' : run.stage === 'done' ? '（候选）' : '（构建中）'}` }))] })}
             ${field({ label: '复核状态', name: 'status', value: state.status, options: [{ value: '', label: '全部' }, ...Object.entries(ENUMS.reviewStatus).map(([value, label]) => ({ value, label }))] })}
             ${field({ label: '优先级', name: 'priority', value: state.priority, options: [{ value: '', label: '全部' }, ...Object.entries(ENUMS.priority).map(([value, label]) => ({ value, label }))] })}
             ${field({ label: '模块', name: 'module', value: state.module, options: [{ value: '', label: '全部' }, ...Object.entries(ENUMS.module).map(([value, label]) => ({ value, label }))] })}
@@ -104,6 +105,7 @@ export const recommendationsPage = {
             { key: 'lift', label: '提升度', className: 'num', render: (row) => row.lift.toFixed(3) },
             { key: 'score', label: '分数', className: 'num', render: (row) => `<span class="hl">${row.score.toFixed(3)}</span>` },
             { key: 'priority', label: '优先级', render: (row) => `<span class="badge ${badgeTone(row.priority)}">${esc(ENUMS.priority[row.priority] || row.priority)}</span>` },
+            { key: 'carry_state', label: '继承', render: (row) => `<span class="badge ${row.carry_state === 'same' ? 'ok' : row.carry_state === 'changed' ? 'pending' : 'info'}">${esc(ENUMS.carryState[row.carry_state] || row.carry_state)}</span>` },
             { key: 'status', label: '复核', render: (row) => `<span class="badge ${reviewTone(row.status)}">${esc(ENUMS.reviewStatus[row.status] || row.status)}</span>` },
           ],
         })}

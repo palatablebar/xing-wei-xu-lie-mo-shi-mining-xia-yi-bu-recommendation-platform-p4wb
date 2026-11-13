@@ -68,6 +68,55 @@ MINE_STATUS_ORDER: list[str] = [
 ]
 
 
+class RunStage(StrEnum):
+    """可恢复重挖的四个阶段：模式 → 推荐 → 覆盖率全部完成后才允许切换正式版。"""
+
+    QUEUED = "queued"
+    PATTERNS = "patterns"
+    RECOMMEND = "recommend"
+    COVERAGE = "coverage"
+    DONE = "done"
+    FAILED = "failed"
+
+
+RUN_STAGE_LABELS: dict[str, str] = {
+    RunStage.QUEUED.value: "排队",
+    RunStage.PATTERNS.value: "模式挖掘",
+    RunStage.RECOMMEND.value: "推荐生成",
+    RunStage.COVERAGE.value: "覆盖率统计",
+    RunStage.DONE.value: "待切换",
+    RunStage.FAILED.value: "失败",
+}
+
+
+class RunEdition(StrEnum):
+    CANDIDATE = "candidate"
+    ACTIVE = "active"
+    ARCHIVED = "archived"
+
+
+RUN_EDITION_LABELS: dict[str, str] = {
+    RunEdition.CANDIDATE.value: "候选版",
+    RunEdition.ACTIVE.value: "正式版",
+    RunEdition.ARCHIVED.value: "历史版",
+}
+
+
+class CarryState(StrEnum):
+    """复核意见继承口径：同用户+后缀+下一步沿用原结论；任一变化回待复核。"""
+
+    NEW = "new"
+    SAME = "same"
+    CHANGED = "changed"
+
+
+CARRY_STATE_LABELS: dict[str, str] = {
+    CarryState.NEW.value: "新增",
+    CarryState.SAME.value: "沿用原结论",
+    CarryState.CHANGED.value: "口径变化·待复核",
+}
+
+
 class TriggerKind(StrEnum):
     MANUAL = "manual"
     SCHEDULE = "schedule"
